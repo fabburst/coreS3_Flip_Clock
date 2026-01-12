@@ -1,13 +1,14 @@
 #include <M5Unified.h>
 #include <lvgl.h>
 #include <WiFi.h>
-#include "secrets.h"
+#include "secret.h"
 
 static lv_disp_draw_buf_t draw_buf;
 static lv_color_t buf[320 * 20];
 lv_obj_t *card_h, *card_m, *info_label;
 int last_h = -1, last_m = -1;
 
+// --- Affichage et Flush ---
 void my_disp_flush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *color_p) {
     uint32_t w = (area->x2 - area->x1 + 1);
     uint32_t h = (area->y2 - area->y1 + 1);
@@ -15,6 +16,7 @@ void my_disp_flush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *color
     lv_disp_flush_ready(disp);
 }
 
+// --- Création des unités de l'horloge ---
 lv_obj_t* create_clock_unit(lv_obj_t* parent, int x) {
     lv_obj_t* cont = lv_obj_create(parent);
     lv_obj_set_size(cont, 140, 180);
@@ -32,10 +34,11 @@ lv_obj_t* create_clock_unit(lv_obj_t* parent, int x) {
     return cont;
 }
 
+// --- Animation Flip ---
 void play_flip_anim(lv_obj_t* card, int new_val) {
-    static char text_buf[12][3];
+    static char text_buf[24][4]; 
     static int b_idx = 0;
-    b_idx = (b_idx + 1) % 12;
+    b_idx = (b_idx + 1) % 24;
     sprintf(text_buf[b_idx], "%02d", new_val);
     lv_obj_set_user_data(card, (void*)text_buf[b_idx]);
 
@@ -62,65 +65,96 @@ void play_flip_anim(lv_obj_t* card, int new_val) {
     lv_anim_start(&a);
 }
 
+// --- Setup Principal ---
 void setup() {
     auto cfg = M5.config();
     M5.begin(cfg);
+    
+    // Correction écran blanc : on initialise l'écran physique en noir tout de suite
     M5.Display.setBrightness(120);
     M5.Display.fillScreen(TFT_BLACK);
 
+    // Initialisation LVGL
     lv_init();
     lv_disp_draw_buf_init(&draw_buf, buf, NULL, 320 * 20);
     static lv_disp_drv_t disp_drv;
     lv_disp_drv_init(&disp_drv);
-    disp_drv.hor_res = 320; disp_drv.ver_res = 240;
+    disp_drv.hor_res = 320; 
+    disp_drv.ver_res = 240;
     disp_drv.flush_cb = my_disp_flush;
     disp_drv.draw_buf = &draw_buf;
     lv_disp_drv_register(&disp_drv);
 
+    // Correction écran blanc (LVGL) : on force le fond de l'objet écran en noir
     lv_obj_set_style_bg_color(lv_scr_act(), lv_color_black(), 0);
+
+    // Label d'information
     info_label = lv_label_create(lv_scr_act());
     lv_obj_set_style_text_color(info_label, lv_color_hex(0x666666), 0);
     lv_obj_align(info_label, LV_ALIGN_BOTTOM_MID, 0, -10);
-    lv_label_set_text(info_label, "Synchro WiFi...");
+    lv_label_set_text(info_label, "Connexion WiFi...");
     lv_timer_handler();
 
+    // WiFi et Temps
     WiFi.begin(ssid, password);
     unsigned long start_wifi = millis();
-    while (WiFi.status() != WL_CONNECTED && (millis() - start_wifi < 3000)) { delay(100); }
-
-    if (WiFi.status() == WL_CONNECTED) {
-        // Règle précise pour la France (CET = GMT+1, CEST = GMT+2)
-        configTzTime("CET-1CEST,M3.5.0,M10.5.0/3", "pool.ntp.org", "time.google.com");
-        
-        struct tm timeinfo;
-        if (getLocalTime(&timeinfo, 5000)) { 
-            M5.Rtc.setDateTime(&timeinfo);
-        }
+    while (WiFi.status() != WL_CONNECTED && (millis() - start_wifi < 8000)) { 
+        delay(250); 
+        lv_timer_handler(); // Garde LVGL actif pendant l'attente
     }
 
+    // Règle précise pour la France (CET/CEST)
+    configTzTime("CET-1CEST,M3.5.0,M10.5.0/3", "pool.ntp.org", "time.google.com");
+
+    if (WiFi.status() == WL_CONNECTED) {
+        struct tm timeinfo;
+        if (getLocalTime(&timeinfo, 10000)) { 
+            auto dt_rtc = M5.Rtc.getDateTime();
+            // On ne met à jour le RTC physique que si l'année est fausse (ex: 1970 ou 2020)
+            // pour éviter de cumuler +1h à chaque redémarrage.
+            if (dt_rtc.date.year < 2025) {
+                M5.Rtc.setDateTime(&timeinfo);
+                lv_label_set_text(info_label, "Sync NTP OK");
+            } else {
+                lv_label_set_text(info_label, "Heure OK (RTC)");
+            }
+        }
+    } else {
+        lv_label_set_text(info_label, "Mode Offline");
+    }
+
+    // Création de l'interface
     card_h = create_clock_unit(lv_scr_act(), 15);
     card_m = create_clock_unit(lv_scr_act(), 165);
 
-    // Lecture du RTC
-    auto dt = M5.Rtc.getDateTime();
-    last_h = dt.time.hours;
-    last_m = dt.time.minutes;
+    // Initialisation des variables avec l'heure système corrigée
+    struct tm ti;
+    if(getLocalTime(&ti)) {
+        last_h = ti.tm_hour;
+        last_m = ti.tm_min;
+    }
     lv_label_set_text_fmt(lv_obj_get_child(card_h, 0), "%02d", last_h);
     lv_label_set_text_fmt(lv_obj_get_child(card_m, 0), "%02d", last_m);
 
+    // Timer de mise à jour de l'horloge
     lv_timer_create([](lv_timer_t* t){
-        auto dt = M5.Rtc.getDateTime();
-        if (dt.time.minutes != last_m) {
-            if (dt.time.hours != last_h) {
-                play_flip_anim(card_h, dt.time.hours);
-                last_h = dt.time.hours;
+        struct tm now;
+        if (getLocalTime(&now)) {
+            if (now.tm_min != last_m) {
+                if (now.tm_hour != last_h) {
+                    play_flip_anim(card_h, now.tm_hour);
+                    last_h = now.tm_hour;
+                }
+                play_flip_anim(card_m, now.tm_min);
+                last_m = now.tm_min; 
             }
-            play_flip_anim(card_m, dt.time.minutes);
-            last_m = dt.time.minutes; 
         }
     }, 1000, NULL);
 
-    lv_timer_create([](lv_timer_t* t){ lv_obj_add_flag(info_label, LV_OBJ_FLAG_HIDDEN); }, 5000, NULL);
+    // Cacher le texte d'info après 5 sec
+    lv_timer_create([](lv_timer_t* t){ 
+        lv_obj_add_flag(info_label, LV_OBJ_FLAG_HIDDEN); 
+    }, 5000, NULL);
 }
 
 void loop() {
