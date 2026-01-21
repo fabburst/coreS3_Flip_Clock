@@ -1,14 +1,14 @@
 #include <M5Unified.h>
 #include <lvgl.h>
 #include <WiFi.h>
-#include "secret.h"
+#include "secret.h" // Contient 'ssid' et 'password'
 
 static lv_disp_draw_buf_t draw_buf;
 static lv_color_t buf[320 * 20];
 lv_obj_t *card_h, *card_m, *info_label;
 int last_h = -1, last_m = -1;
 
-// --- Affichage et Flush ---
+// --- Affichage et Flush (M5Stack -> LVGL) ---
 void my_disp_flush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *color_p) {
     uint32_t w = (area->x2 - area->x1 + 1);
     uint32_t h = (area->y2 - area->y1 + 1);
@@ -16,7 +16,7 @@ void my_disp_flush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *color
     lv_disp_flush_ready(disp);
 }
 
-// --- Création des unités de l'horloge ---
+// --- Création d'une unité (Carte Heure ou Minute) ---
 lv_obj_t* create_clock_unit(lv_obj_t* parent, int x) {
     lv_obj_t* cont = lv_obj_create(parent);
     lv_obj_set_size(cont, 140, 180);
@@ -34,14 +34,16 @@ lv_obj_t* create_clock_unit(lv_obj_t* parent, int x) {
     return cont;
 }
 
-// --- Animation Flip ---
+// --- Animation "Flip" ---
 void play_flip_anim(lv_obj_t* card, int new_val) {
+    // Buffer statique pour stocker le texte pendant l'animation
     static char text_buf[24][4]; 
     static int b_idx = 0;
     b_idx = (b_idx + 1) % 24;
     sprintf(text_buf[b_idx], "%02d", new_val);
     lv_obj_set_user_data(card, (void*)text_buf[b_idx]);
 
+    // Animation 1 : Fermeture (Hauteur 180 -> 2)
     lv_anim_t a;
     lv_anim_init(&a);
     lv_anim_set_var(&a, card);
@@ -49,6 +51,7 @@ void play_flip_anim(lv_obj_t* card, int new_val) {
     lv_anim_set_time(&a, 300);
     lv_anim_set_exec_cb(&a, [](void* var, int32_t v) { lv_obj_set_height((lv_obj_t*)var, v); });
     
+    // Callback : Changement de texte et Réouverture
     lv_anim_set_ready_cb(&a, [](lv_anim_t* anim) {
         lv_obj_t* c = (lv_obj_t*)anim->var;
         const char* txt = (const char*)lv_obj_get_user_data(c);
@@ -70,11 +73,11 @@ void setup() {
     auto cfg = M5.config();
     M5.begin(cfg);
     
-    // Correction écran blanc : on initialise l'écran physique en noir tout de suite
+    // 1. Initialisation de l'écran (Physique)
     M5.Display.setBrightness(120);
     M5.Display.fillScreen(TFT_BLACK);
 
-    // Initialisation LVGL
+    // 2. Initialisation LVGL
     lv_init();
     lv_disp_draw_buf_init(&draw_buf, buf, NULL, 320 * 20);
     static lv_disp_drv_t disp_drv;
@@ -85,78 +88,83 @@ void setup() {
     disp_drv.draw_buf = &draw_buf;
     lv_disp_drv_register(&disp_drv);
 
-    // Correction écran blanc (LVGL) : on force le fond de l'objet écran en noir
+    // Fond noir global
     lv_obj_set_style_bg_color(lv_scr_act(), lv_color_black(), 0);
 
-    // Label d'information
+    // Label d'information (statut WiFi/Heure)
     info_label = lv_label_create(lv_scr_act());
     lv_obj_set_style_text_color(info_label, lv_color_hex(0x666666), 0);
     lv_obj_align(info_label, LV_ALIGN_BOTTOM_MID, 0, -10);
     lv_label_set_text(info_label, "Connexion WiFi...");
     lv_timer_handler();
 
-    // WiFi et Temps
+    // 3. Connexion WiFi (Timeout 8 sec)
     WiFi.begin(ssid, password);
     unsigned long start_wifi = millis();
     while (WiFi.status() != WL_CONNECTED && (millis() - start_wifi < 8000)) { 
         delay(250); 
-        lv_timer_handler(); // Garde LVGL actif pendant l'attente
+        lv_timer_handler(); 
     }
 
-    // Règle précise pour la France (CET/CEST)
+    // 4. Synchronisation NTP (Si WiFi OK)
+    // Configuration Timezone France (CET/CEST)
     configTzTime("CET-1CEST,M3.5.0,M10.5.0/3", "pool.ntp.org", "time.google.com");
 
     if (WiFi.status() == WL_CONNECTED) {
         struct tm timeinfo;
+        // Tente de récupérer l'heure NTP pendant 10 sec max
         if (getLocalTime(&timeinfo, 10000)) { 
             auto dt_rtc = M5.Rtc.getDateTime();
-            // On ne met à jour le RTC physique que si l'année est fausse (ex: 1970 ou 2020)
-            // pour éviter de cumuler +1h à chaque redémarrage.
+            
+            // Mise à jour du RTC matériel si l'année semble incorrecte (reset ou première utilisation)
+            // ou pour forcer la sync au démarrage.
             if (dt_rtc.date.year < 2025) {
                 M5.Rtc.setDateTime(&timeinfo);
-                lv_label_set_text(info_label, "Sync NTP OK");
+                lv_label_set_text(info_label, "Sync NTP OK -> RTC");
             } else {
-                lv_label_set_text(info_label, "Heure OK (RTC)");
+                lv_label_set_text(info_label, "Heure RTC OK");
             }
         }
     } else {
-        lv_label_set_text(info_label, "Mode Offline");
+        lv_label_set_text(info_label, "Mode Offline (RTC)");
     }
 
-    // Création de l'interface
+    // 5. Création de l'interface graphique
     card_h = create_clock_unit(lv_scr_act(), 15);
     card_m = create_clock_unit(lv_scr_act(), 165);
 
-    // Initialisation des variables avec l'heure système corrigée
-    struct tm ti;
-    if(getLocalTime(&ti)) {
-        last_h = ti.tm_hour;
-        last_m = ti.tm_min;
-    }
+    // Initialisation immédiate des valeurs affichées depuis le RTC pour éviter le délai d'une seconde
+    auto dt_init = M5.Rtc.getDateTime();
+    last_h = dt_init.time.hours;
+    last_m = dt_init.time.minutes;
     lv_label_set_text_fmt(lv_obj_get_child(card_h, 0), "%02d", last_h);
     lv_label_set_text_fmt(lv_obj_get_child(card_m, 0), "%02d", last_m);
 
-    // Timer de mise à jour de l'horloge
+    // 6. Timer de mise à jour (Correction: Utilise le RTC matériel)
     lv_timer_create([](lv_timer_t* t){
-        struct tm now;
-        if (getLocalTime(&now)) {
-            if (now.tm_min != last_m) {
-                if (now.tm_hour != last_h) {
-                    play_flip_anim(card_h, now.tm_hour);
-                    last_h = now.tm_hour;
-                }
-                play_flip_anim(card_m, now.tm_min);
-                last_m = now.tm_min; 
+        // Lecture de l'heure stable depuis la puce RTC (BM8563)
+        // Ceci corrige le problème de dérive quand le WiFi est coupé.
+        auto dt = M5.Rtc.getDateTime();
+        
+        // Vérification des minutes
+        if (dt.time.minutes != last_m) {
+            // Vérification des heures uniquement si la minute change
+            if (dt.time.hours != last_h) {
+                play_flip_anim(card_h, dt.time.hours);
+                last_h = dt.time.hours;
             }
+            play_flip_anim(card_m, dt.time.minutes);
+            last_m = dt.time.minutes; 
         }
     }, 1000, NULL);
 
-    // Cacher le texte d'info après 5 sec
+    // Timer pour cacher le message de statut après 5 secondes
     lv_timer_create([](lv_timer_t* t){ 
         lv_obj_add_flag(info_label, LV_OBJ_FLAG_HIDDEN); 
     }, 5000, NULL);
 }
 
+// --- Boucle Principale ---
 void loop() {
     M5.update();
     lv_timer_handler();
